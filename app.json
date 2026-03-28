@@ -1,0 +1,37 @@
+{
+  "expo": {
+    "name": "Book Store",
+    "slug": "book-store",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Capture shelf photos to identify books and recommend similar titles.",
+        "NSPhotoLibraryUsageDescription": "Choose shelf photos from your library for book detection."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#F4E8D5"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.RECORD_AUDIO"
+      ],
+      "package": "com.anonymous.bookstore"
+    },
+    "plugins": [
+      "expo-image-picker"
+    ]
+  }
+}
