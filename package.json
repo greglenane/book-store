@@ -13,6 +13,7 @@
     "@react-native-ml-kit/text-recognition": "^2.0.0",
     "expo": "~54.0.11",
     "expo-dev-client": "~6.0.20",
+    "expo-image-manipulator": "~14.0.8",
     "expo-image-picker": "~17.0.8",
     "expo-status-bar": "~3.0.8",
     "react": "19.1.0",

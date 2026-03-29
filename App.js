@@ -1,9 +1,11 @@
 import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
-import { useState } from "react";
+import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
+import { useEffect, useRef, useState } from "react";
 import {
   Alert,
   Image,
+  PanResponder,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -25,8 +27,98 @@ const uploadShelfImage = async (asset) => {
   };
 };
 
+const MIN_CROP_SIZE = 80;
+
+const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+
+const getRenderedImageFrame = (containerLayout, imageSize) => {
+  if (!containerLayout?.width || !containerLayout?.height || !imageSize?.width || !imageSize?.height) {
+    return null;
+  }
+
+  const containerAspect = containerLayout.width / containerLayout.height;
+  const imageAspect = imageSize.width / imageSize.height;
+
+  if (imageAspect > containerAspect) {
+    const width = containerLayout.width;
+    const height = width / imageAspect;
+    return {
+      x: 0,
+      y: (containerLayout.height - height) / 2,
+      width,
+      height
+    };
+  }
+
+  const height = containerLayout.height;
+  const width = height * imageAspect;
+  return {
+    x: (containerLayout.width - width) / 2,
+    y: 0,
+    width,
+    height
+  };
+};
+
+const createInitialCropRect = (frame) => {
+  if (!frame) {
+    return null;
+  }
+
+  const width = Math.max(MIN_CROP_SIZE, frame.width * 0.72);
+  const height = Math.max(MIN_CROP_SIZE, frame.height * 0.72);
+
+  return {
+    x: frame.x + (frame.width - width) / 2,
+    y: frame.y + (frame.height - height) / 2,
+    width,
+    height
+  };
+};
+
+const clampCropRect = (rect, frame) => {
+  if (!rect || !frame) {
+    return rect;
+  }
+
+  const width = clamp(rect.width, MIN_CROP_SIZE, frame.width);
+  const height = clamp(rect.height, MIN_CROP_SIZE, frame.height);
+  const x = clamp(rect.x, frame.x, frame.x + frame.width - width);
+  const y = clamp(rect.y, frame.y, frame.y + frame.height - height);
+
+  return { x, y, width, height };
+};
+
+const displayCropToSourceCrop = (rect, frame, imageSize) => {
+  if (!rect || !frame || !imageSize?.width || !imageSize?.height) {
+    return null;
+  }
+
+  const scaleX = imageSize.width / frame.width;
+  const scaleY = imageSize.height / frame.height;
+
+  return {
+    originX: Math.round((rect.x - frame.x) * scaleX),
+    originY: Math.round((rect.y - frame.y) * scaleY),
+    width: Math.round(rect.width * scaleX),
+    height: Math.round(rect.height * scaleY)
+  };
+};
+
+const resolveImageSize = (uri) =>
+  new Promise((resolve, reject) => {
+    Image.getSize(
+      uri,
+      (width, height) => resolve({ width, height }),
+      (error) => reject(error)
+    );
+  });
+
 export default function App() {
   const [selectedImage, setSelectedImage] = useState(null);
+  const [imageSize, setImageSize] = useState(null);
+  const [previewLayout, setPreviewLayout] = useState(null);
+  const [cropRect, setCropRect] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
@@ -34,13 +126,57 @@ export default function App() {
   const [recognizedSpines, setRecognizedSpines] = useState([]);
   const [rawDetectedText, setRawDetectedText] = useState("");
   const [analysisStats, setAnalysisStats] = useState(null);
+  const cropRectRef = useRef(null);
+  const imageFrameRef = useRef(null);
+  const moveStartRef = useRef(null);
+  const topLeftStartRef = useRef(null);
+  const topRightStartRef = useRef(null);
+  const bottomLeftStartRef = useRef(null);
+  const bottomRightStartRef = useRef(null);
+  const selectedImageUriRef = useRef(null);
 
-  const handlePickResult = (result) => {
+  useEffect(() => {
+    cropRectRef.current = cropRect ? { ...cropRect } : null;
+  }, [cropRect]);
+
+  useEffect(() => {
+    const frame = getRenderedImageFrame(previewLayout, imageSize);
+    imageFrameRef.current = frame;
+
+    if (!frame) {
+      return;
+    }
+
+    setCropRect((current) => {
+      const selectedUri = selectedImage?.uri ?? null;
+      if (!current || selectedImageUriRef.current !== selectedUri) {
+        const initial = createInitialCropRect(frame);
+        return initial ? { ...initial } : current;
+      }
+
+      const clamped = clampCropRect(current, frame);
+      return clamped ? { ...clamped } : current;
+    });
+  }, [previewLayout, imageSize, selectedImage]);
+
+  const handlePickResult = async (result) => {
     if (result.canceled || !result.assets?.length) {
       return;
     }
 
-    setSelectedImage(result.assets[0]);
+    const asset = result.assets[0];
+    selectedImageUriRef.current = asset.uri ?? null;
+    setSelectedImage(asset);
+    setImageSize(asset.width && asset.height ? { width: asset.width, height: asset.height } : null);
+    if ((!asset.width || !asset.height) && asset.uri) {
+      try {
+        const size = await resolveImageSize(asset.uri);
+        setImageSize(size);
+      } catch (error) {
+        setImageSize(null);
+      }
+    }
+    setCropRect(null);
     setUploadMessage("");
     setAnalysisMessage("");
     setRecognizedSpines([]);
@@ -79,7 +215,7 @@ export default function App() {
       quality: 0.8
     });
 
-    handlePickResult(result);
+    await handlePickResult(result);
   };
 
   const openLibrary = async () => {
@@ -94,37 +230,12 @@ export default function App() {
       quality: 0.8
     });
 
-    handlePickResult(result);
+    await handlePickResult(result);
   };
 
-  const handleUpload = async () => {
-    if (!selectedImage) {
-      Alert.alert("No image selected", "Choose or capture a shelf photo first.");
-      return;
-    }
-
+  const analyzeSelectedImage = async (asset = selectedImage) => {
     try {
-      setIsUploading(true);
-      const response = await uploadShelfImage(selectedImage);
-      setUploadMessage(`Uploaded shelf image at ${new Date(response.uploadedAt).toLocaleTimeString()}.`);
-    } catch (error) {
-      setUploadMessage("Upload failed. Try again.");
-    } finally {
-      setIsUploading(false);
-    }
-  };
-
-  const handleReadSpines = async () => {
-    if (!selectedImage) {
-      Alert.alert("No image selected", "Choose or capture a shelf photo first.");
-      return;
-    }
-
-    try {
-      setIsAnalyzing(true);
-      setAnalysisMessage("");
-
-      const result = await recognizeBookSpines(selectedImage);
+      const result = await recognizeBookSpines(asset);
       if (!result.available) {
         setRecognizedSpines([]);
         setRawDetectedText("");
@@ -140,7 +251,7 @@ export default function App() {
         result.spines.length
           ? `Detected ${result.spines.length} spine text candidate${result.spines.length === 1 ? "" : "s"}.`
           : result.rawText
-            ? "OCR found text, but no strong spine-title candidates passed filtering."
+            ? "OCR found text, but no strong spine-title candidates passed filtering. Try a tighter crop."
             : "No text was detected. Try a sharper, straighter shelf photo."
       );
     } catch (error) {
@@ -148,22 +259,198 @@ export default function App() {
       setRawDetectedText("");
       setAnalysisStats(null);
       setAnalysisMessage("Text recognition failed. Rebuild the app if the native OCR module was just added.");
+    }
+  };
+
+  const handleUpload = async () => {
+    if (!selectedImage) {
+      Alert.alert("No image selected", "Choose or capture a shelf photo first.");
+      return;
+    }
+
+    const frame = imageFrameRef.current;
+    const currentCrop = cropRectRef.current;
+    const sourceCrop =
+      frame && currentCrop && imageSize ? displayCropToSourceCrop(currentCrop, frame, imageSize) : null;
+    const uploadAsset = sourceCrop
+      ? await manipulateAsync(
+          selectedImage.uri,
+          [
+            {
+              crop: sourceCrop
+            }
+          ],
+          {
+            compress: 0.95,
+            format: SaveFormat.JPEG
+          }
+        )
+      : selectedImage;
+
+    try {
+      setIsUploading(true);
+      setIsAnalyzing(true);
+      setUploadMessage("");
+      setAnalysisMessage("");
+      const response = await uploadShelfImage(uploadAsset);
+      setUploadMessage(`Uploaded shelf image at ${new Date(response.uploadedAt).toLocaleTimeString()}.`);
+      await analyzeSelectedImage(uploadAsset);
+    } catch (error) {
+      setUploadMessage("Upload failed. Try again.");
+      setRecognizedSpines([]);
+      setRawDetectedText("");
+      setAnalysisStats(null);
+      setAnalysisMessage("Text recognition did not run because the upload step failed.");
     } finally {
+      setIsUploading(false);
       setIsAnalyzing(false);
     }
   };
 
   const ocrAvailability = getSpineRecognitionAvailability();
 
+  const updateCropRect = (nextRect) => {
+    const frame = imageFrameRef.current;
+    if (!frame) {
+      return;
+    }
+
+    setCropRect((current) => {
+      const base = typeof nextRect === "function" ? nextRect(current) : nextRect;
+      if (!base) {
+        return current;
+      }
+
+      const clamped = clampCropRect(base, frame);
+      cropRectRef.current = clamped ? { ...clamped } : null;
+      return clamped ? { ...clamped } : current;
+    });
+  };
+
+  const moveResponder = PanResponder.create({
+    onStartShouldSetPanResponder: () => true,
+    onMoveShouldSetPanResponder: () => true,
+    onStartShouldSetPanResponderCapture: () => true,
+    onMoveShouldSetPanResponderCapture: () => true,
+    onPanResponderTerminationRequest: () => false,
+    onShouldBlockNativeResponder: () => true,
+    onPanResponderGrant: () => {
+      moveStartRef.current = cropRectRef.current ? { ...cropRectRef.current } : null;
+    },
+    onPanResponderMove: (_, gestureState) => {
+      const frame = imageFrameRef.current;
+      const start = moveStartRef.current;
+      if (!frame || !start) {
+        return;
+      }
+
+      updateCropRect({
+        x: start.x + gestureState.dx,
+        y: start.y + gestureState.dy,
+        width: start.width,
+        height: start.height
+      });
+    },
+    onPanResponderRelease: () => {
+      moveStartRef.current = null;
+    }
+  });
+
+  const createCornerResponder = (corner) =>
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onStartShouldSetPanResponderCapture: () => true,
+      onMoveShouldSetPanResponderCapture: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: () => {
+        const current = cropRectRef.current ? { ...cropRectRef.current } : null;
+        if (corner === "topLeft") {
+          topLeftStartRef.current = current;
+        }
+        if (corner === "topRight") {
+          topRightStartRef.current = current;
+        }
+        if (corner === "bottomLeft") {
+          bottomLeftStartRef.current = current;
+        }
+        if (corner === "bottomRight") {
+          bottomRightStartRef.current = current;
+        }
+      },
+      onPanResponderMove: (_, gestureState) => {
+        const frame = imageFrameRef.current;
+        if (!frame) {
+          return;
+        }
+
+        const start =
+          corner === "topLeft"
+            ? topLeftStartRef.current
+            : corner === "topRight"
+              ? topRightStartRef.current
+              : corner === "bottomLeft"
+                ? bottomLeftStartRef.current
+                : bottomRightStartRef.current;
+
+        if (!start) {
+          return;
+        }
+
+        let next = { ...start };
+
+        if (corner === "topLeft") {
+          next.x = start.x + gestureState.dx;
+          next.y = start.y + gestureState.dy;
+          next.width = start.width - gestureState.dx;
+          next.height = start.height - gestureState.dy;
+        } else if (corner === "topRight") {
+          next.y = start.y + gestureState.dy;
+          next.width = start.width + gestureState.dx;
+          next.height = start.height - gestureState.dy;
+        } else if (corner === "bottomLeft") {
+          next.x = start.x + gestureState.dx;
+          next.width = start.width - gestureState.dx;
+          next.height = start.height + gestureState.dy;
+        } else {
+          next.width = start.width + gestureState.dx;
+          next.height = start.height + gestureState.dy;
+        }
+
+        updateCropRect(next);
+      },
+      onPanResponderRelease: () => {
+        if (corner === "topLeft") {
+          topLeftStartRef.current = null;
+        }
+        if (corner === "topRight") {
+          topRightStartRef.current = null;
+        }
+        if (corner === "bottomLeft") {
+          bottomLeftStartRef.current = null;
+        }
+        if (corner === "bottomRight") {
+          bottomRightStartRef.current = null;
+        }
+      }
+    });
+
+  const topLeftResponder = createCornerResponder("topLeft");
+  const topRightResponder = createCornerResponder("topRight");
+  const bottomLeftResponder = createCornerResponder("bottomLeft");
+  const bottomRightResponder = createCornerResponder("bottomRight");
+
+  const previewFrame = getRenderedImageFrame(previewLayout, imageSize);
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <StatusBar style="dark" />
       <ScrollView contentContainerStyle={styles.container}>
         <Text style={styles.eyebrow}>Book discovery from the shelf</Text>
-        <Text style={styles.title}>Capture or select a shelf photo</Text>
+        <Text style={styles.title}>Bookshelf Scanner</Text>
         <Text style={styles.subtitle}>
-          Start with a clear image of the books in front of you. This intake flow will feed the
-          recognition and recommendation pipeline.
+          Take or choose a photo, then crop to the shelf area before upload.
         </Text>
         <View style={styles.banner}>
           <Text style={styles.bannerTitle}>Current OCR mode</Text>
@@ -175,16 +462,72 @@ export default function App() {
         </View>
 
         <View style={styles.card}>
+          <View
+            style={styles.previewStage}
+            onLayout={(event) => setPreviewLayout(event.nativeEvent.layout)}
+          >
+            {selectedImage && previewFrame ? (
+              <>
+                <Image
+                  source={{ uri: selectedImage.uri }}
+                  style={[
+                    styles.previewImage,
+                    {
+                      left: previewFrame.x,
+                      top: previewFrame.y,
+                      width: previewFrame.width,
+                      height: previewFrame.height
+                    }
+                  ]}
+                />
+                {cropRect ? (
+                  <View
+                    pointerEvents="box-none"
+                    style={[
+                      styles.cropBox,
+                      {
+                        left: cropRect.x,
+                        top: cropRect.y,
+                        width: cropRect.width,
+                        height: cropRect.height
+                      }
+                    ]}
+                  >
+                    <View pointerEvents="none" style={styles.cropOverlay} />
+                    <View style={styles.cropMoveArea} {...moveResponder.panHandlers} />
+                    <View
+                      style={[styles.handle, styles.handleTopLeft]}
+                      {...topLeftResponder.panHandlers}
+                    />
+                    <View
+                      style={[styles.handle, styles.handleTopRight]}
+                      {...topRightResponder.panHandlers}
+                    />
+                    <View
+                      style={[styles.handle, styles.handleBottomLeft]}
+                      {...bottomLeftResponder.panHandlers}
+                    />
+                    <View
+                      style={[styles.handle, styles.handleBottomRight]}
+                      {...bottomRightResponder.panHandlers}
+                    />
+                  </View>
+                ) : null}
+              </>
+            ) : (
+              <View style={styles.placeholder}>
+                <Text style={styles.placeholderTitle}>No shelf image yet</Text>
+                <Text style={styles.placeholderText}>
+                  Use the camera in the app or choose a photo from the library.
+                </Text>
+              </View>
+            )}
+          </View>
           {selectedImage ? (
-            <Image source={{ uri: selectedImage.uri }} style={styles.previewImage} />
-          ) : (
-            <View style={styles.placeholder}>
-              <Text style={styles.placeholderTitle}>No shelf image yet</Text>
-              <Text style={styles.placeholderText}>
-                Use the camera in the app or choose a photo from the library.
-              </Text>
-            </View>
-          )}
+            <Text style={styles.cropHint}>
+              Drag the box to move it. Drag a corner to resize the crop area.
+            </Text>
+          ) : null}
 
           <View style={styles.buttonRow}>
             <Pressable onPress={openCamera} style={[styles.button, styles.primaryButton]}>
@@ -196,28 +539,19 @@ export default function App() {
           </View>
 
           <Pressable
-            onPress={handleReadSpines}
-            disabled={isAnalyzing}
-            style={[styles.button, styles.analysisButton, isAnalyzing && styles.disabledButton]}
-          >
-            <Text style={styles.analysisButtonText}>
-              {isAnalyzing ? "Reading Spines..." : "Read Book Spines"}
-            </Text>
-          </Pressable>
-
-          <Pressable
             onPress={handleUpload}
-            disabled={isUploading}
-            style={[styles.button, styles.uploadButton, isUploading && styles.disabledButton]}
+            disabled={isUploading || isAnalyzing}
+            style={[
+              styles.button,
+              styles.uploadButton,
+              (isUploading || isAnalyzing) && styles.disabledButton
+            ]}
           >
             <Text style={styles.uploadButtonText}>
-              {isUploading ? "Uploading..." : "Upload for Processing"}
+              {isUploading || isAnalyzing ? "Uploading and Reading..." : "Upload Bookshelf"}
             </Text>
           </Pressable>
 
-          <Text style={styles.helperText}>
-            Best results come from a straight-on shelf photo with readable spines and even lighting.
-          </Text>
           {analysisMessage ? <Text style={styles.statusText}>{analysisMessage}</Text> : null}
           {recognizedSpines.length ? (
             <View style={styles.resultsSection}>
@@ -225,7 +559,20 @@ export default function App() {
               {recognizedSpines.map((spine, index) => (
                 <View key={`${spine.text}-${index}`} style={styles.resultRow}>
                   <Text style={styles.resultIndex}>{index + 1}</Text>
-                  <Text style={styles.resultText}>{spine.text}</Text>
+                  <View style={styles.resultContent}>
+                    <Text style={styles.resultText}>{spine.text}</Text>
+                    <Text style={styles.resultMeta}>
+                      OCR score: {spine.score?.toFixed?.(1) ?? spine.score ?? "n/a"}
+                    </Text>
+                    {spine.sourceRotation !== undefined ? (
+                      <Text style={styles.resultMeta}>Source rotation: {spine.sourceRotation} deg</Text>
+                    ) : null}
+                    {spine.sourceParts?.length ? (
+                      <Text style={styles.resultMeta}>
+                        Source parts: {spine.sourceParts.join(" | ")}
+                      </Text>
+                    ) : null}
+                  </View>
                 </View>
               ))}
             </View>
@@ -235,7 +582,9 @@ export default function App() {
               <Text style={styles.resultsTitle}>OCR debug output</Text>
               {analysisStats ? (
                 <Text style={styles.debugMeta}>
-                  Blocks: {analysisStats.blockCount} | Lines: {analysisStats.lineCount}
+                  Variants: {analysisStats.variantCount ?? 0} | Best rotation: {analysisStats.bestRotation ?? 0} |
+                  Blocks: {analysisStats.blockCount} | Lines: {analysisStats.lineCount} |
+                  Filtered: {analysisStats.filteredLineCount ?? 0} | Candidates: {analysisStats.candidateCount ?? 0}
                 </Text>
               ) : null}
               <View style={styles.rawTextBox}>
@@ -336,11 +685,64 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     textAlign: "center"
   },
-  previewImage: {
-    width: "100%",
-    height: 360,
+  previewStage: {
+    minHeight: 360,
     borderRadius: 20,
+    overflow: "hidden",
     backgroundColor: "#E6D7C4"
+  },
+  previewImage: {
+    position: "absolute",
+    borderRadius: 0,
+    backgroundColor: "#E6D7C4"
+  },
+  cropHint: {
+    marginTop: 10,
+    color: "#6A5A4B",
+    fontSize: 13,
+    lineHeight: 18
+  },
+  cropBox: {
+    position: "absolute",
+    borderWidth: 2,
+    borderColor: "#F4E8D5"
+  },
+  cropOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(47, 107, 93, 0.08)"
+  },
+  cropMoveArea: {
+    position: "absolute",
+    left: 30,
+    right: 30,
+    top: 30,
+    bottom: 30
+  },
+  handle: {
+    position: "absolute",
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#FFFDF9",
+    borderWidth: 2,
+    borderColor: "#2F6B5D",
+    zIndex: 3
+  },
+  handleTopLeft: {
+    left: -18,
+    top: -18
+  },
+  handleTopRight: {
+    right: -18,
+    top: -18
+  },
+  handleBottomLeft: {
+    left: -18,
+    bottom: -18
+  },
+  handleBottomRight: {
+    right: -18,
+    bottom: -18
   },
   buttonRow: {
     flexDirection: "row",
@@ -367,10 +769,6 @@ const styles = StyleSheet.create({
     marginTop: 12,
     backgroundColor: "#B04A2B"
   },
-  analysisButton: {
-    marginTop: 12,
-    backgroundColor: "#7C5CFA"
-  },
   disabledButton: {
     opacity: 0.6
   },
@@ -386,11 +784,6 @@ const styles = StyleSheet.create({
   },
   uploadButtonText: {
     color: "#FFF7F0",
-    fontSize: 16,
-    fontWeight: "700"
-  },
-  analysisButtonText: {
-    color: "#F8F3FF",
     fontSize: 16,
     fontWeight: "700"
   },
@@ -424,6 +817,9 @@ const styles = StyleSheet.create({
     gap: 10,
     paddingVertical: 8
   },
+  resultContent: {
+    flex: 1
+  },
   resultIndex: {
     minWidth: 24,
     color: "#8B5E3C",
@@ -435,6 +831,12 @@ const styles = StyleSheet.create({
     color: "#3D3025",
     fontSize: 15,
     lineHeight: 22
+  },
+  resultMeta: {
+    marginTop: 4,
+    color: "#7A6A5C",
+    fontSize: 13,
+    lineHeight: 18
   },
   debugMeta: {
     marginBottom: 10,
