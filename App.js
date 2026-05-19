@@ -1,11 +1,10 @@
 import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import {
   Alert,
   Image,
-  PanResponder,
   Pressable,
   SafeAreaView,
   ScrollView,
@@ -13,21 +12,11 @@ import {
   Text,
   View
 } from "react-native";
+import { detectBookSpines, DETECTION_API_BASE_URL } from "./src/services/spineDetection";
 import {
   getSpineRecognitionAvailability,
   recognizeBookSpines
 } from "./src/services/spineRecognition";
-
-const uploadShelfImage = async (asset) => {
-  await new Promise((resolve) => setTimeout(resolve, 900));
-
-  return {
-    uri: asset.uri,
-    uploadedAt: new Date().toISOString()
-  };
-};
-
-const MIN_CROP_SIZE = 80;
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -60,51 +49,6 @@ const getRenderedImageFrame = (containerLayout, imageSize) => {
   };
 };
 
-const createInitialCropRect = (frame) => {
-  if (!frame) {
-    return null;
-  }
-
-  const width = Math.max(MIN_CROP_SIZE, frame.width * 0.72);
-  const height = Math.max(MIN_CROP_SIZE, frame.height * 0.72);
-
-  return {
-    x: frame.x + (frame.width - width) / 2,
-    y: frame.y + (frame.height - height) / 2,
-    width,
-    height
-  };
-};
-
-const clampCropRect = (rect, frame) => {
-  if (!rect || !frame) {
-    return rect;
-  }
-
-  const width = clamp(rect.width, MIN_CROP_SIZE, frame.width);
-  const height = clamp(rect.height, MIN_CROP_SIZE, frame.height);
-  const x = clamp(rect.x, frame.x, frame.x + frame.width - width);
-  const y = clamp(rect.y, frame.y, frame.y + frame.height - height);
-
-  return { x, y, width, height };
-};
-
-const displayCropToSourceCrop = (rect, frame, imageSize) => {
-  if (!rect || !frame || !imageSize?.width || !imageSize?.height) {
-    return null;
-  }
-
-  const scaleX = imageSize.width / frame.width;
-  const scaleY = imageSize.height / frame.height;
-
-  return {
-    originX: Math.round((rect.x - frame.x) * scaleX),
-    originY: Math.round((rect.y - frame.y) * scaleY),
-    width: Math.round(rect.width * scaleX),
-    height: Math.round(rect.height * scaleY)
-  };
-};
-
 const resolveImageSize = (uri) =>
   new Promise((resolve, reject) => {
     Image.getSize(
@@ -114,60 +58,57 @@ const resolveImageSize = (uri) =>
     );
   });
 
+const normalizeBoxToSourceCrop = (box, imageSize) => {
+  const originX = Math.floor(clamp(box.x, 0, 0.999) * imageSize.width);
+  const originY = Math.floor(clamp(box.y, 0, 0.999) * imageSize.height);
+  const width = Math.round(clamp(box.width, 0, 1) * imageSize.width);
+  const height = Math.round(clamp(box.height, 0, 1) * imageSize.height);
+
+  return {
+    originX,
+    originY,
+    width: Math.max(1, Math.min(width, imageSize.width - originX)),
+    height: Math.max(1, Math.min(height, imageSize.height - originY))
+  };
+};
+
+const getDetectionBoxStyle = (region, frame) => ({
+  left: frame.x + region.box.x * frame.width,
+  top: frame.y + region.box.y * frame.height,
+  width: region.box.width * frame.width,
+  height: region.box.height * frame.height
+});
+
 export default function App() {
   const [selectedImage, setSelectedImage] = useState(null);
+  const [selectedImageSource, setSelectedImageSource] = useState("library");
   const [imageSize, setImageSize] = useState(null);
   const [previewLayout, setPreviewLayout] = useState(null);
-  const [cropRect, setCropRect] = useState(null);
-  const [isUploading, setIsUploading] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [uploadMessage, setUploadMessage] = useState("");
-  const [analysisMessage, setAnalysisMessage] = useState("");
-  const [recognizedSpines, setRecognizedSpines] = useState([]);
-  const [rawDetectedText, setRawDetectedText] = useState("");
-  const [analysisStats, setAnalysisStats] = useState(null);
-  const cropRectRef = useRef(null);
-  const imageFrameRef = useRef(null);
-  const moveStartRef = useRef(null);
-  const topLeftStartRef = useRef(null);
-  const topRightStartRef = useRef(null);
-  const bottomLeftStartRef = useRef(null);
-  const bottomRightStartRef = useRef(null);
-  const selectedImageUriRef = useRef(null);
+  const [statusMessage, setStatusMessage] = useState("");
+  const [detectedRegions, setDetectedRegions] = useState([]);
+  const [spineResults, setSpineResults] = useState([]);
+  const [detectionDebug, setDetectionDebug] = useState(null);
 
-  useEffect(() => {
-    cropRectRef.current = cropRect ? { ...cropRect } : null;
-  }, [cropRect]);
+  const resetAnalysis = () => {
+    setStatusMessage("");
+    setDetectedRegions([]);
+    setSpineResults([]);
+    setDetectionDebug(null);
+  };
 
-  useEffect(() => {
-    const frame = getRenderedImageFrame(previewLayout, imageSize);
-    imageFrameRef.current = frame;
-
-    if (!frame) {
-      return;
-    }
-
-    setCropRect((current) => {
-      const selectedUri = selectedImage?.uri ?? null;
-      if (!current || selectedImageUriRef.current !== selectedUri) {
-        const initial = createInitialCropRect(frame);
-        return initial ? { ...initial } : current;
-      }
-
-      const clamped = clampCropRect(current, frame);
-      return clamped ? { ...clamped } : current;
-    });
-  }, [previewLayout, imageSize, selectedImage]);
-
-  const handlePickResult = async (result) => {
+  const handlePickResult = async (result, source) => {
     if (result.canceled || !result.assets?.length) {
       return;
     }
 
     const asset = result.assets[0];
-    selectedImageUriRef.current = asset.uri ?? null;
     setSelectedImage(asset);
+    setSelectedImageSource(source);
     setImageSize(asset.width && asset.height ? { width: asset.width, height: asset.height } : null);
+    resetAnalysis();
+
     if ((!asset.width || !asset.height) && asset.uri) {
       try {
         const size = await resolveImageSize(asset.uri);
@@ -176,12 +117,6 @@ export default function App() {
         setImageSize(null);
       }
     }
-    setCropRect(null);
-    setUploadMessage("");
-    setAnalysisMessage("");
-    setRecognizedSpines([]);
-    setRawDetectedText("");
-    setAnalysisStats(null);
   };
 
   const requestPermission = async (type) => {
@@ -215,7 +150,7 @@ export default function App() {
       quality: 0.8
     });
 
-    await handlePickResult(result);
+    await handlePickResult(result, "camera");
   };
 
   const openLibrary = async () => {
@@ -230,217 +165,97 @@ export default function App() {
       quality: 0.8
     });
 
-    await handlePickResult(result);
+    await handlePickResult(result, "library");
   };
 
-  const analyzeSelectedImage = async (asset = selectedImage) => {
-    try {
-      const result = await recognizeBookSpines(asset);
-      if (!result.available) {
-        setRecognizedSpines([]);
-        setRawDetectedText("");
-        setAnalysisStats(null);
-        setAnalysisMessage(result.reason);
-        return;
+  const recognizeRegionText = async (region) => {
+    const sourceCrop = normalizeBoxToSourceCrop(region.box, imageSize);
+    const spineAsset = await manipulateAsync(
+      selectedImage.uri,
+      [{ crop: sourceCrop }],
+      {
+        compress: 0.95,
+        format: SaveFormat.JPEG
       }
+    );
 
-      setRecognizedSpines(result.spines);
-      setRawDetectedText(result.rawText);
-      setAnalysisStats(result.debug ?? null);
-      setAnalysisMessage(
-        result.spines.length
-          ? `Detected ${result.spines.length} spine text candidate${result.spines.length === 1 ? "" : "s"}.`
-          : result.rawText
-            ? "OCR found text, but no strong spine-title candidates passed filtering. Try a tighter crop."
-            : "No text was detected. Try a sharper, straighter shelf photo."
-      );
-    } catch (error) {
-      setRecognizedSpines([]);
-      setRawDetectedText("");
-      setAnalysisStats(null);
-      setAnalysisMessage("Text recognition failed. Rebuild the app if the native OCR module was just added.");
+    const result = await recognizeBookSpines(spineAsset);
+    if (!result.available) {
+      return {
+        ...region,
+        ocrAvailable: false,
+        message: result.reason,
+        textCandidates: [],
+        rawText: ""
+      };
     }
+
+    return {
+      ...region,
+      ocrAvailable: true,
+      message: result.spines.length
+        ? `Read ${result.spines.length} text candidate${result.spines.length === 1 ? "" : "s"}.`
+        : "No strong text candidates found for this spine.",
+      textCandidates: result.spines,
+      rawText: result.rawText,
+      ocrDebug: result.debug ?? null
+    };
   };
 
-  const handleUpload = async () => {
+  const handleDetect = async () => {
     if (!selectedImage) {
       Alert.alert("No image selected", "Choose or capture a shelf photo first.");
       return;
     }
 
-    const frame = imageFrameRef.current;
-    const currentCrop = cropRectRef.current;
-    const sourceCrop =
-      frame && currentCrop && imageSize ? displayCropToSourceCrop(currentCrop, frame, imageSize) : null;
-    const uploadAsset = sourceCrop
-      ? await manipulateAsync(
-          selectedImage.uri,
-          [
-            {
-              crop: sourceCrop
-            }
-          ],
-          {
-            compress: 0.95,
-            format: SaveFormat.JPEG
-          }
-        )
-      : selectedImage;
+    if (!imageSize?.width || !imageSize?.height) {
+      Alert.alert("Image not ready", "The selected image dimensions are still loading.");
+      return;
+    }
 
     try {
-      setIsUploading(true);
+      setIsDetecting(true);
+      setIsAnalyzing(false);
+      setStatusMessage("Detecting book spines...");
+      setDetectedRegions([]);
+      setSpineResults([]);
+      setDetectionDebug(null);
+
+      const detection = await detectBookSpines(selectedImage, selectedImageSource);
+      const regions = detection.regions ?? [];
+      setDetectedRegions(regions);
+      setDetectionDebug(detection.debug ?? null);
+
+      if (!regions.length) {
+        setStatusMessage("No book spines were detected. Try a clearer, straighter shelf photo.");
+        return;
+      }
+
       setIsAnalyzing(true);
-      setUploadMessage("");
-      setAnalysisMessage("");
-      const response = await uploadShelfImage(uploadAsset);
-      setUploadMessage(`Uploaded shelf image at ${new Date(response.uploadedAt).toLocaleTimeString()}.`);
-      await analyzeSelectedImage(uploadAsset);
+      setStatusMessage(`Detected ${regions.length} spine${regions.length === 1 ? "" : "s"}. Reading text...`);
+
+      const results = [];
+      for (const region of regions) {
+        // OCR depends on native ML Kit and image manipulation, so keep this sequential to reduce memory spikes.
+        // eslint-disable-next-line no-await-in-loop
+        const result = await recognizeRegionText(region);
+        results.push(result);
+        setSpineResults([...results]);
+      }
+
+      setStatusMessage(`Detected and analyzed ${regions.length} spine${regions.length === 1 ? "" : "s"}.`);
     } catch (error) {
-      setUploadMessage("Upload failed. Try again.");
-      setRecognizedSpines([]);
-      setRawDetectedText("");
-      setAnalysisStats(null);
-      setAnalysisMessage("Text recognition did not run because the upload step failed.");
+      setDetectedRegions([]);
+      setSpineResults([]);
+      setDetectionDebug(null);
+      setStatusMessage(error.message || "Spine detection service unavailable.");
     } finally {
-      setIsUploading(false);
+      setIsDetecting(false);
       setIsAnalyzing(false);
     }
   };
 
   const ocrAvailability = getSpineRecognitionAvailability();
-
-  const updateCropRect = (nextRect) => {
-    const frame = imageFrameRef.current;
-    if (!frame) {
-      return;
-    }
-
-    setCropRect((current) => {
-      const base = typeof nextRect === "function" ? nextRect(current) : nextRect;
-      if (!base) {
-        return current;
-      }
-
-      const clamped = clampCropRect(base, frame);
-      cropRectRef.current = clamped ? { ...clamped } : null;
-      return clamped ? { ...clamped } : current;
-    });
-  };
-
-  const moveResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
-    onMoveShouldSetPanResponder: () => true,
-    onStartShouldSetPanResponderCapture: () => true,
-    onMoveShouldSetPanResponderCapture: () => true,
-    onPanResponderTerminationRequest: () => false,
-    onShouldBlockNativeResponder: () => true,
-    onPanResponderGrant: () => {
-      moveStartRef.current = cropRectRef.current ? { ...cropRectRef.current } : null;
-    },
-    onPanResponderMove: (_, gestureState) => {
-      const frame = imageFrameRef.current;
-      const start = moveStartRef.current;
-      if (!frame || !start) {
-        return;
-      }
-
-      updateCropRect({
-        x: start.x + gestureState.dx,
-        y: start.y + gestureState.dy,
-        width: start.width,
-        height: start.height
-      });
-    },
-    onPanResponderRelease: () => {
-      moveStartRef.current = null;
-    }
-  });
-
-  const createCornerResponder = (corner) =>
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onStartShouldSetPanResponderCapture: () => true,
-      onMoveShouldSetPanResponderCapture: () => true,
-      onPanResponderTerminationRequest: () => false,
-      onShouldBlockNativeResponder: () => true,
-      onPanResponderGrant: () => {
-        const current = cropRectRef.current ? { ...cropRectRef.current } : null;
-        if (corner === "topLeft") {
-          topLeftStartRef.current = current;
-        }
-        if (corner === "topRight") {
-          topRightStartRef.current = current;
-        }
-        if (corner === "bottomLeft") {
-          bottomLeftStartRef.current = current;
-        }
-        if (corner === "bottomRight") {
-          bottomRightStartRef.current = current;
-        }
-      },
-      onPanResponderMove: (_, gestureState) => {
-        const frame = imageFrameRef.current;
-        if (!frame) {
-          return;
-        }
-
-        const start =
-          corner === "topLeft"
-            ? topLeftStartRef.current
-            : corner === "topRight"
-              ? topRightStartRef.current
-              : corner === "bottomLeft"
-                ? bottomLeftStartRef.current
-                : bottomRightStartRef.current;
-
-        if (!start) {
-          return;
-        }
-
-        let next = { ...start };
-
-        if (corner === "topLeft") {
-          next.x = start.x + gestureState.dx;
-          next.y = start.y + gestureState.dy;
-          next.width = start.width - gestureState.dx;
-          next.height = start.height - gestureState.dy;
-        } else if (corner === "topRight") {
-          next.y = start.y + gestureState.dy;
-          next.width = start.width + gestureState.dx;
-          next.height = start.height - gestureState.dy;
-        } else if (corner === "bottomLeft") {
-          next.x = start.x + gestureState.dx;
-          next.width = start.width - gestureState.dx;
-          next.height = start.height + gestureState.dy;
-        } else {
-          next.width = start.width + gestureState.dx;
-          next.height = start.height + gestureState.dy;
-        }
-
-        updateCropRect(next);
-      },
-      onPanResponderRelease: () => {
-        if (corner === "topLeft") {
-          topLeftStartRef.current = null;
-        }
-        if (corner === "topRight") {
-          topRightStartRef.current = null;
-        }
-        if (corner === "bottomLeft") {
-          bottomLeftStartRef.current = null;
-        }
-        if (corner === "bottomRight") {
-          bottomRightStartRef.current = null;
-        }
-      }
-    });
-
-  const topLeftResponder = createCornerResponder("topLeft");
-  const topRightResponder = createCornerResponder("topRight");
-  const bottomLeftResponder = createCornerResponder("bottomLeft");
-  const bottomRightResponder = createCornerResponder("bottomRight");
-
   const previewFrame = getRenderedImageFrame(previewLayout, imageSize);
 
   return (
@@ -450,13 +265,15 @@ export default function App() {
         <Text style={styles.eyebrow}>Book discovery from the shelf</Text>
         <Text style={styles.title}>Bookshelf Scanner</Text>
         <Text style={styles.subtitle}>
-          Take or choose a photo, then crop to the shelf area before upload.
+          Take or choose a shelf photo, then detect individual book spines before OCR.
         </Text>
         <View style={styles.banner}>
-          <Text style={styles.bannerTitle}>Current OCR mode</Text>
+          <Text style={styles.bannerTitle}>Detection service</Text>
+          <Text style={styles.bannerText}>{DETECTION_API_BASE_URL}</Text>
+          <Text style={[styles.bannerTitle, styles.bannerTitleSecondary]}>Current OCR mode</Text>
           <Text style={styles.bannerText}>
             {ocrAvailability.available
-              ? "Native ML Kit spine reading is available in this build."
+              ? "Native ML Kit OCR is available in this build."
               : ocrAvailability.reason}
           </Text>
         </View>
@@ -480,39 +297,17 @@ export default function App() {
                     }
                   ]}
                 />
-                {cropRect ? (
+                {detectedRegions.map((region, index) => (
                   <View
-                    pointerEvents="box-none"
-                    style={[
-                      styles.cropBox,
-                      {
-                        left: cropRect.x,
-                        top: cropRect.y,
-                        width: cropRect.width,
-                        height: cropRect.height
-                      }
-                    ]}
+                    key={region.id ?? `region-${index}`}
+                    pointerEvents="none"
+                    style={[styles.detectionBox, getDetectionBoxStyle(region, previewFrame)]}
                   >
-                    <View pointerEvents="none" style={styles.cropOverlay} />
-                    <View style={styles.cropMoveArea} {...moveResponder.panHandlers} />
-                    <View
-                      style={[styles.handle, styles.handleTopLeft]}
-                      {...topLeftResponder.panHandlers}
-                    />
-                    <View
-                      style={[styles.handle, styles.handleTopRight]}
-                      {...topRightResponder.panHandlers}
-                    />
-                    <View
-                      style={[styles.handle, styles.handleBottomLeft]}
-                      {...bottomLeftResponder.panHandlers}
-                    />
-                    <View
-                      style={[styles.handle, styles.handleBottomRight]}
-                      {...bottomRightResponder.panHandlers}
-                    />
+                    <Text style={styles.detectionLabel}>
+                      {index + 1} | {Math.round((region.confidence ?? 0) * 100)}%
+                    </Text>
                   </View>
-                ) : null}
+                ))}
               </>
             ) : (
               <View style={styles.placeholder}>
@@ -523,11 +318,6 @@ export default function App() {
               </View>
             )}
           </View>
-          {selectedImage ? (
-            <Text style={styles.cropHint}>
-              Drag the box to move it. Drag a corner to resize the crop area.
-            </Text>
-          ) : null}
 
           <View style={styles.buttonRow}>
             <Pressable onPress={openCamera} style={[styles.button, styles.primaryButton]}>
@@ -539,62 +329,57 @@ export default function App() {
           </View>
 
           <Pressable
-            onPress={handleUpload}
-            disabled={isUploading || isAnalyzing}
+            onPress={handleDetect}
+            disabled={isDetecting || isAnalyzing}
             style={[
               styles.button,
               styles.uploadButton,
-              (isUploading || isAnalyzing) && styles.disabledButton
+              (isDetecting || isAnalyzing) && styles.disabledButton
             ]}
           >
             <Text style={styles.uploadButtonText}>
-              {isUploading || isAnalyzing ? "Uploading and Reading..." : "Upload Bookshelf"}
+              {isDetecting || isAnalyzing ? "Detecting and Reading..." : "Detect Book Spines"}
             </Text>
           </Pressable>
 
-          {analysisMessage ? <Text style={styles.statusText}>{analysisMessage}</Text> : null}
-          {recognizedSpines.length ? (
+          {statusMessage ? <Text style={styles.statusText}>{statusMessage}</Text> : null}
+          {detectionDebug ? (
+            <Text style={styles.debugMeta}>
+              Model: {detectionDebug.modelVersion ?? "unknown"} | Processing:{" "}
+              {detectionDebug.processingMs ?? 0} ms | Boxes: {detectedRegions.length}
+            </Text>
+          ) : null}
+
+          {spineResults.length ? (
             <View style={styles.resultsSection}>
-              <Text style={styles.resultsTitle}>Detected spine text</Text>
-              {recognizedSpines.map((spine, index) => (
-                <View key={`${spine.text}-${index}`} style={styles.resultRow}>
+              <Text style={styles.resultsTitle}>Detected spines</Text>
+              {spineResults.map((spine, index) => (
+                <View key={spine.id ?? `spine-${index}`} style={styles.resultRow}>
                   <Text style={styles.resultIndex}>{index + 1}</Text>
                   <View style={styles.resultContent}>
-                    <Text style={styles.resultText}>{spine.text}</Text>
-                    <Text style={styles.resultMeta}>
-                      OCR score: {spine.score?.toFixed?.(1) ?? spine.score ?? "n/a"}
+                    <Text style={styles.resultText}>
+                      Confidence: {Math.round((spine.confidence ?? 0) * 100)}%
                     </Text>
-                    {spine.sourceRotation !== undefined ? (
-                      <Text style={styles.resultMeta}>Source rotation: {spine.sourceRotation} deg</Text>
-                    ) : null}
-                    {spine.sourceParts?.length ? (
+                    <Text style={styles.resultMeta}>{spine.message}</Text>
+                    {spine.textCandidates?.length ? (
+                      spine.textCandidates.map((candidate, candidateIndex) => (
+                        <Text
+                          key={`${candidate.text}-${candidateIndex}`}
+                          style={styles.candidateText}
+                        >
+                          {candidate.text}
+                        </Text>
+                      ))
+                    ) : (
                       <Text style={styles.resultMeta}>
-                        Source parts: {spine.sourceParts.join(" | ")}
+                        {spine.rawText || "No OCR text returned for this spine."}
                       </Text>
-                    ) : null}
+                    )}
                   </View>
                 </View>
               ))}
             </View>
           ) : null}
-          {analysisStats || rawDetectedText ? (
-            <View style={styles.resultsSection}>
-              <Text style={styles.resultsTitle}>OCR debug output</Text>
-              {analysisStats ? (
-                <Text style={styles.debugMeta}>
-                  Variants: {analysisStats.variantCount ?? 0} | Best rotation: {analysisStats.bestRotation ?? 0} |
-                  Blocks: {analysisStats.blockCount} | Lines: {analysisStats.lineCount} |
-                  Filtered: {analysisStats.filteredLineCount ?? 0} | Candidates: {analysisStats.candidateCount ?? 0}
-                </Text>
-              ) : null}
-              <View style={styles.rawTextBox}>
-                <Text style={styles.rawTextValue}>
-                  {rawDetectedText || "OCR ran, but no raw text was returned."}
-                </Text>
-              </View>
-            </View>
-          ) : null}
-          {uploadMessage ? <Text style={styles.statusText}>{uploadMessage}</Text> : null}
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -647,6 +432,9 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
     textTransform: "uppercase"
   },
+  bannerTitleSecondary: {
+    marginTop: 12
+  },
   bannerText: {
     color: "#5E5147",
     fontSize: 14,
@@ -696,53 +484,20 @@ const styles = StyleSheet.create({
     borderRadius: 0,
     backgroundColor: "#E6D7C4"
   },
-  cropHint: {
-    marginTop: 10,
-    color: "#6A5A4B",
-    fontSize: 13,
-    lineHeight: 18
-  },
-  cropBox: {
+  detectionBox: {
     position: "absolute",
-    borderWidth: 2,
-    borderColor: "#F4E8D5"
-  },
-  cropOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(47, 107, 93, 0.08)"
-  },
-  cropMoveArea: {
-    position: "absolute",
-    left: 30,
-    right: 30,
-    top: 30,
-    bottom: 30
-  },
-  handle: {
-    position: "absolute",
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    backgroundColor: "#FFFDF9",
     borderWidth: 2,
     borderColor: "#2F6B5D",
-    zIndex: 3
+    backgroundColor: "rgba(47, 107, 93, 0.1)"
   },
-  handleTopLeft: {
-    left: -18,
-    top: -18
-  },
-  handleTopRight: {
-    right: -18,
-    top: -18
-  },
-  handleBottomLeft: {
-    left: -18,
-    bottom: -18
-  },
-  handleBottomRight: {
-    right: -18,
-    bottom: -18
+  detectionLabel: {
+    alignSelf: "flex-start",
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    backgroundColor: "#2F6B5D",
+    color: "#FFFDF9",
+    fontSize: 11,
+    fontWeight: "800"
   },
   buttonRow: {
     flexDirection: "row",
@@ -787,12 +542,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: "700"
   },
-  helperText: {
-    marginTop: 14,
-    color: "#6A5A4B",
-    fontSize: 14,
-    lineHeight: 20
-  },
   statusText: {
     marginTop: 10,
     color: "#8A361C",
@@ -830,7 +579,8 @@ const styles = StyleSheet.create({
     flex: 1,
     color: "#3D3025",
     fontSize: 15,
-    lineHeight: 22
+    lineHeight: 22,
+    fontWeight: "700"
   },
   resultMeta: {
     marginTop: 4,
@@ -838,22 +588,16 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18
   },
-  debugMeta: {
-    marginBottom: 10,
-    color: "#6A5A4B",
-    fontSize: 14,
-    fontWeight: "600"
-  },
-  rawTextBox: {
-    borderRadius: 16,
-    padding: 14,
-    backgroundColor: "#F5EFE6",
-    borderWidth: 1,
-    borderColor: "#E4D5BF"
-  },
-  rawTextValue: {
+  candidateText: {
+    marginTop: 8,
     color: "#3D3025",
-    fontSize: 14,
+    fontSize: 15,
     lineHeight: 21
+  },
+  debugMeta: {
+    marginTop: 10,
+    color: "#6A5A4B",
+    fontSize: 13,
+    fontWeight: "600"
   }
 });

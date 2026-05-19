@@ -6,3 +6,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 dist/
+services/image-processing/datasets/book-spines/images/
+services/image-processing/datasets/book-spines/labels/
+services/image-processing/models/*.pt
+services/image-processing/runs/
+services/image-processing/.venv/
+__pycache__/
+.pytest_cache/
